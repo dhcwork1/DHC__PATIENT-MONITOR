@@ -1,0 +1,151 @@
+#include <Wire.h>
+
+// Pin definisi untuk ESP32-S3
+#define POMPA   5
+#define VALVE1  4
+#define VALVE2  6
+
+#define MAX_DATA 200  // jumlah data tekanan
+uint16_t raw_data[MAX_DATA];
+float tekanan_mmHg[MAX_DATA];
+float osilasi[MAX_DATA];
+int data_count = 0;
+
+const byte SENSOR_ADDR = 0x28;
+bool mulai = false;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(); // default SDA/SCL ESP32
+
+  pinMode(POMPA, OUTPUT);
+  pinMode(VALVE1, OUTPUT);
+  pinMode(VALVE2, OUTPUT);
+
+  digitalWrite(POMPA, LOW);
+  digitalWrite(VALVE1, HIGH); // tertutup
+  digitalWrite(VALVE2, HIGH); // tertutup
+
+  Serial.println("=== SISTEM NIBP ESP32-S3 AKTIF ===");
+  Serial.println("Ketik START di Serial Monitor untuk memulai.");
+}
+
+void loop() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.equalsIgnoreCase("START")) {
+      mulai = true;
+      data_count = 0;
+      Serial.println("\n> Mulai pengukuran NIBP...");
+      inflasi();
+    }
+  }
+}
+
+void inflasi() {
+  digitalWrite(POMPA, HIGH);
+  digitalWrite(VALVE1, HIGH);
+  digitalWrite(VALVE2, HIGH);
+
+  while (true) {
+    float tekanan = bacaTekanan();
+    Serial.print("Tekanan: ");
+    Serial.print(tekanan);
+    Serial.println(" mmHg");
+
+    if (tekanan >= 160.0) {
+    Serial.println("> Tekanan target tercapai. Mulai deflasi...");
+    break;
+    }
+    delay(50);
+  }
+
+  mulai_deflasi();
+}
+
+void mulai_deflasi() {
+  digitalWrite(POMPA, LOW);     // Matikan pompa
+  digitalWrite(VALVE1, LOW);    // Buka valve1
+
+  while (data_count < MAX_DATA) {
+    float t = bacaTekanan();
+    tekanan_mmHg[data_count] = t;
+
+    if (data_count >= 2)
+      osilasi[data_count] = abs(t - tekanan_mmHg[data_count - 1]);
+    else
+      osilasi[data_count] = 0;
+
+    data_count++;
+    delay(80);
+  }
+
+  hitung_dan_tampilkan_hasil();
+}
+
+float bacaTekanan() {
+  Wire.beginTransmission(SENSOR_ADDR);
+  Wire.endTransmission();
+  Wire.requestFrom(SENSOR_ADDR, 4);
+  if (Wire.available() < 4) return 0;
+
+  uint8_t b1 = Wire.read();
+  uint8_t b2 = Wire.read();
+  Wire.read(); Wire.read(); // buang suhu
+
+  uint16_t raw = ((b1 & 0x3F) << 8) | b2;
+  raw_data[data_count] = raw;
+
+  // Kalibrasi: 1648 = 0 mmHg, 6800 = 300 mmHg
+  float mmHg = (raw - 1648) * 0.05825;
+  if (mmHg < 0) mmHg = 0;
+  return mmHg;
+}
+
+void hitung_dan_tampilkan_hasil() {
+  // Cari MAP (osilasi maksimum)
+  float max_osc = 0;
+  int idx_map = 0;
+  for (int i = 10; i < data_count - 10; i++) {
+    if (osilasi[i] > max_osc) {
+      max_osc = osilasi[i];
+      idx_map = i;
+    }
+  }
+
+  float map_pressure = tekanan_mmHg[idx_map];
+
+  // Cari sistolik (55% sebelum MAP)
+  float systolic = 0;
+  float threshold_sys = max_osc * 0.55;
+  for (int i = idx_map; i > 0; i--) {
+    if (osilasi[i] < threshold_sys) {
+      systolic = tekanan_mmHg[i];
+      break;
+    }
+  }
+
+  // Cari diastolik (85% setelah MAP)
+  float diastolic = 0;
+  float threshold_dia = max_osc * 0.85;
+  for (int i = idx_map; i < data_count; i++) {
+    if (osilasi[i] < threshold_dia) {
+      diastolic = tekanan_mmHg[i];
+      break;
+    }
+  }
+
+  // Setelah selesai → buka valve buang (VALVE2)
+  digitalWrite(VALVE2, LOW);
+  delay(2000); // buang sisa udara
+  digitalWrite(VALVE1, LOW);
+  digitalWrite(VALVE2, LOW);
+
+  Serial.println("\n=== HASIL NIBP ===");
+  Serial.print("Sistolik  : "); Serial.print(systolic, 1); Serial.println(" mmHg");
+  Serial.print("Diastolik : "); Serial.print(diastolic, 1); Serial.println(" mmHg");
+  Serial.print("MAP       : "); Serial.print(map_pressure, 1); Serial.println(" mmHg");
+  Serial.println("===================================");
+  Serial.println("Ketik START lagi untuk pengukuran baru.");
+}
