@@ -1,0 +1,166 @@
+// ===========================================================
+// Arduino Data Sender + Temp Sensor ADS1115 (1 NTC)
+// ===========================================================
+
+// ---------------------- LIBRARY ----------------------
+#include <SPI.h>
+#include "protocentral_afe44xx.h"
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <math.h>
+
+// ---------------------- KONFIGURASI SPO2 (AFE44XX) ----------------------
+#define AFE44XX_CS_PIN   7
+#define AFE44XX_PWDN_PIN 4
+#define AFE44XX_INTNUM   0
+
+AFE44XX afe44xx(AFE44XX_CS_PIN, AFE44XX_PWDN_PIN);
+afe44xx_data afe44xx_raw_data;
+
+// ---------------------- KONFIGURASI TEMPERATURE (ADS1115 + NTC) ----------------------
+Adafruit_ADS1115 ads;
+
+#define SERIES_RESISTOR     2252.0  
+#define NOMINAL_RESISTANCE  2252.0
+#define NOMINAL_TEMPERATURE 25.0
+#define BETA_COEFFICIENT    3890
+#define ADS_VDD             3.3
+
+#define FILTER_SIZE 10
+double tempBuffer[FILTER_SIZE];
+int bufferIndex = 0;
+bool bufferFilled = false;
+
+// ---------------------- VARIABEL ----------------------
+int32_t prValue = 0;
+int32_t spo2Value = 0;
+float spo2WaveValue = 0.0;
+
+float ecgWaveValue_I = 0.0;
+float ecgWaveValue_II = 0.0;
+float ecgWaveValue_III = 0.0;
+float ecgWaveValue_V = 0.0;
+float ecgWaveValue_V1 = 0.0;
+float ecgWaveValue_V2 = 0.0;
+float ecgWaveValue_V3 = 0.0;
+float ecgWaveValue_V4 = 0.0;
+float ecgWaveValue_V5 = 0.0;
+
+float respWaveValue = 0.0;
+int respValue = 0;
+float tempValue = 0;  // dari NTC
+int nibpSystolic = 0;
+int nibpDiastolic = 0;
+
+unsigned long lastUpdateTime = 0;
+const int updateInterval = 10; // 100 Hz
+
+// ---------------------- FUNGSI TEMPERATURE ----------------------
+double getTemperature(int16_t adcValue) {
+  double voltage = ads.computeVolts(adcValue);
+  double resistance = (SERIES_RESISTOR * voltage) / (ADS_VDD - voltage);
+
+  double steinhart = resistance / NOMINAL_RESISTANCE;
+  steinhart = log(steinhart);
+  steinhart /= BETA_COEFFICIENT;
+  steinhart += 1.0 / (NOMINAL_TEMPERATURE + 273.15);
+  steinhart = 1.0 / steinhart;
+  steinhart -= 273.15;
+
+  return steinhart;
+}
+
+double applyFilter(double *buffer, double newVal) {
+  buffer[bufferIndex] = newVal;
+  double sum = 0;
+  int count = bufferFilled ? FILTER_SIZE : (bufferIndex + 1);
+  for (int i = 0; i < count; i++) {
+    sum += buffer[i];
+  }
+  return sum / count;
+}
+
+// ---------------------- SETUP ----------------------
+void setup() {
+  Serial.begin(9600);
+  randomSeed(analogRead(A0));
+
+  // SPO2
+  SPI.begin();
+  afe44xx.afe44xx_init();
+  Serial.println("AFE44xx Inisiasi Selesai");
+
+  // ADS1115
+  Wire.begin();
+  if (!ads.begin()) {
+    Serial.println("Gagal inisialisasi ADS1115!");
+    while (1);
+  }
+  ads.setGain(GAIN_ONE);
+}
+
+// ---------------------- LOOP ----------------------
+void loop() {
+  delay(8); // sinkronisasi dengan SPO2
+
+  if (millis() - lastUpdateTime >= updateInterval) {
+    lastUpdateTime = millis();
+
+    // --- BACA SPO2 ---
+    afe44xx.get_AFE44XX_Data(&afe44xx_raw_data);
+    if (afe44xx_raw_data.spo2 == -999) {
+      prValue = 0;
+      spo2Value = 0;
+    } else {
+      prValue = afe44xx_raw_data.heart_rate;
+      spo2Value = afe44xx_raw_data.spo2;
+    }
+    spo2WaveValue = afe44xx_raw_data.RED_data; 
+
+    // --- BACA TEMPERATURE dari ADS1115 (NTC di AIN0 - AIN1 misalnya) ---
+    int16_t adc = ads.readADC_Differential_0_1();
+    double t = getTemperature(adc);
+    tempValue = applyFilter(tempBuffer, t);
+
+    bufferIndex++;
+    if (bufferIndex >= FILTER_SIZE) {
+      bufferIndex = 0;
+      bufferFilled = true;
+    }
+
+    // --- SIMULASI ECG + RESP (masih dummy, bisa diganti sensor lain) ---
+    ecgWaveValue_I = 0.0;
+    ecgWaveValue_II = 0.0;
+    ecgWaveValue_III = 0.0;
+    ecgWaveValue_V = 0.0;
+    ecgWaveValue_V1 = 0.0;
+    ecgWaveValue_V2 = 0.0;
+    ecgWaveValue_V3 = 0.0;
+    ecgWaveValue_V4 = 0.0;
+    ecgWaveValue_V5 = 0.0;
+    respWaveValue = 0.0;
+    respValue = 0;
+    nibpSystolic = 0;
+    nibpDiastolic = 0;
+
+    // --- KIRIM DATA SERIAL ---
+    String dataToSend = String(ecgWaveValue_I, 2) + "," + 
+                        String(ecgWaveValue_II, 2) + "," +
+                        String(ecgWaveValue_III, 2) + "," +
+                        String(ecgWaveValue_V, 2) + "," +
+                        String(ecgWaveValue_V1, 2) + "," +
+                        String(ecgWaveValue_V2, 2) + "," +
+                        String(ecgWaveValue_V3, 2) + "," +
+                        String(ecgWaveValue_V4, 2) + "," +
+                        String(ecgWaveValue_V5, 2) + "," +
+                        String(prValue) + "," +
+                        String(spo2Value) + "," +
+                        String(spo2WaveValue) + "," +
+                        String(respValue) + "," +
+                        String(respWaveValue, 2) + "," +
+                        String(tempValue, 2) + "," +
+                        String(nibpSystolic) + "\\" + String(nibpDiastolic);
+
+    Serial.println(dataToSend);
+  }
+}
