@@ -1,0 +1,427 @@
+import sys
+import numpy as np
+import datetime
+import serial
+import threading
+import time
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame,
+    QPushButton, QDialog, QMenu, QAction
+)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+import pyqtgraph as pg
+
+# Subclass QLabel to make it clickable
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+
+# ----------- Serial Data Communication ----------
+class SerialData(QObject):
+    # Sinyal untuk data gelombang dan numerik
+    data_received = pyqtSignal(dict)
+
+# ----------- Main Class ----------
+class PatientMonitor(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Patient Monitor")
+        self.setStyleSheet("background-color: black;")
+        
+        # Set window flags to remove title bar and control buttons
+        self.setWindowFlag(Qt.FramelessWindowHint)
+        self.showFullScreen()
+
+        # Serial signal
+        self.serial_data = SerialData()
+        self.serial_data.data_received.connect(self.receive_serial_data)
+
+        # Signal data buffer
+        self.buffer_size = 1000
+        self.timer_interval = 10  # ms
+        self.x = np.linspace(0, self.buffer_size * self.timer_interval / 1000.0, self.buffer_size)
+        self.index = 0
+        
+        # Dictionary untuk menyimpan semua data sinyal
+        self.signal_data = {
+            'I': np.zeros(self.buffer_size),
+            'II': np.zeros(self.buffer_size),
+            'III': np.zeros(self.buffer_size),
+            'V': np.zeros(self.buffer_size),
+            'V1': np.zeros(self.buffer_size),
+            'V2': np.zeros(self.buffer_size),
+            'V3': np.zeros(self.buffer_size),
+            'V4': np.zeros(self.buffer_size),
+            'V5': np.zeros(self.buffer_size),
+            'Pleth': np.zeros(self.buffer_size),
+            'RESP': np.zeros(self.buffer_size)
+        }
+        
+        # Dictionary untuk menyimpan data numerik
+        self.numeric_values = {
+            'HR': '--',
+            'SpO2': '--',
+            'RESP': '--',
+            'TEMP': '--',
+            'NIBP': {'systolic': '--', 'diastolic': '--'}
+        }
+        
+        # Dictionary untuk menyimpan leads yang sedang dipilih
+        self.selected_leads = {
+            'ecg_plot_1': 'I',
+            'ecg_plot_2': 'II',
+            'ecg_plot_3': 'V'
+        }
+        self.ecg_leads = ["I", "II", "III", "V", "V1", "V2", "V3", "V4", "V5"]
+
+        # Timestamp for last data received and flag for first data
+        self.last_data_timestamp = 0
+        self.data_received_once = False
+
+        # Main layout
+        main_layout = QVBoxLayout()
+        top_layout = QHBoxLayout()
+        graph_layout = QVBoxLayout()
+
+        # Signal graphs
+        self.ecg_I_plot, self.ecg_I_curve, self.ecg_I_vline, self.ecg_I_text = self.create_plot("I", "lime", self.signal_data['I'], (-1.5, 1.5), 'ecg_plot_1')
+        self.ecg_II_plot, self.ecg_II_curve, self.ecg_II_vline, self.ecg_II_text = self.create_plot("II", "lime", self.signal_data['II'], (-1.5, 1.5), 'ecg_plot_2')
+        self.ecg_V_plot, self.ecg_V_curve, self.ecg_V_vline, self.ecg_V_text = self.create_plot("V", "lime", self.signal_data['V'], (-1.5, 1.5), 'ecg_plot_3')
+        self.pleth_plot, self.pleth_curve, self.pleth_vline, self.pleth_text = self.create_plot("Pleth", "red", self.signal_data['Pleth'], (-0.2, 1.2))
+        self.resp_plot, self.resp_curve, self.resp_vline, self.resp_text = self.create_plot("RESP", "yellow", self.signal_data['RESP'], (-0.5, 1.5))
+
+        graph_layout.addWidget(self.ecg_I_plot)
+        graph_layout.addWidget(self.ecg_II_plot)
+        graph_layout.addWidget(self.ecg_V_plot)
+        graph_layout.addWidget(self.pleth_plot)
+        graph_layout.addWidget(self.resp_plot)
+        graph_layout.addStretch()
+
+        # Vital data panel
+        info_panel = QVBoxLayout()
+        info_panel.setSpacing(10)
+        info_panel.addLayout(self.create_info_panel())
+
+        # Setting and Start NIBP buttons
+        button_layout = QHBoxLayout()
+        setting_btn = QPushButton("Setting")
+        setting_btn.setStyleSheet("background-color: #007bff; color: white; padding: 12px; font-size: 16px;")
+        setting_btn.clicked.connect(self.show_menu)
+
+        nibp_btn = QPushButton("Start NIBP")
+        nibp_btn.setStyleSheet("background-color: #28a745; color: white; padding: 12px; font-size: 16px;")
+
+        button_layout.addWidget(setting_btn)
+        button_layout.addWidget(nibp_btn)
+        info_panel.addLayout(button_layout)
+
+        # Vertical separator line
+        line = QFrame()
+        line.setFrameShape(QFrame.VLine)
+        line.setStyleSheet("border-left: 2px dashed gray;")
+
+        top_layout.addLayout(graph_layout, 4)
+        top_layout.addWidget(line)
+        top_layout.addLayout(info_panel, 1)
+
+        main_layout.addLayout(top_layout)
+        self.setLayout(main_layout)
+
+        # Timer for GUI updates
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_waveform_display)
+        self.timer.timeout.connect(self.update_datetime)
+        self.timer.start(self.timer_interval)
+
+        # Start serial thread
+        self.start_serial_thread()
+
+    def create_plot(self, title, color, data_array, y_range, plot_name=None):
+        container = QFrame()
+        layout = QVBoxLayout()
+        
+        header_layout = QHBoxLayout()
+        
+        label = ClickableLabel(title)
+        label.setStyleSheet(f"color: {color}; font-size: 14px;")
+        if plot_name:
+            label.clicked.connect(lambda: self.show_lead_menu(plot_name, label))
+        
+        header_layout.addWidget(label)
+        header_layout.addStretch()
+
+        layout.addLayout(header_layout)
+
+        plot = pg.PlotWidget()
+        plot.setBackground('black')
+        plot.setYRange(*y_range)
+        plot.getPlotItem().hideAxis('bottom')
+        plot.getPlotItem().hideAxis('left')
+        curve = plot.plot(self.x, data_array, pen=pg.mkPen(color, width=2))
+        vline = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('black', width=9))
+        plot.addItem(vline)
+        
+        # Add "Lead off" text centered at the top
+        lead_off_text = pg.TextItem(html='<div style="text-align: center; color: white;">Lead off</div>', anchor=(0.5, 0.5))
+        plot.addItem(lead_off_text)
+        lead_off_text.setPos(self.x[self.buffer_size // 2], y_range[1] - 0.2)
+        lead_off_text.hide() # Hide it by default
+
+        layout.addWidget(plot)
+        container.setLayout(layout)
+        return container, curve, vline, lead_off_text
+
+    def show_lead_menu(self, plot_name, label):
+        menu = QMenu(self)
+        menu.setStyleSheet("QMenu { background-color: white; color: black; } QMenu::item { padding: 5px 20px; } QMenu::item:selected { background-color: #f0f0f0; }")
+        
+        current_lead = self.selected_leads[plot_name]
+        
+        # Create a list of available leads, excluding the current one
+        available_leads = [lead for lead in self.ecg_leads if lead != current_lead]
+        
+        for lead in available_leads:
+            action = QAction(lead, self)
+            action.triggered.connect(lambda _, l=lead: self.change_lead(plot_name, label, l))
+            menu.addAction(action)
+            
+        menu.exec_(label.mapToGlobal(label.rect().bottomLeft()))
+
+    def change_lead(self, plot_name, label, new_lead):
+        self.selected_leads[plot_name] = new_lead
+        label.setText(new_lead)
+
+    def create_info_panel(self):
+        layout = QVBoxLayout()
+        top_row = QHBoxLayout()
+        top_row.addStretch()
+        self.label_datetime = QLabel("2025-05-16 12:00:00")
+        self.label_datetime.setStyleSheet("color: gray; font-size: 12px;")
+        self.label_battery = QLabel("Battery: 80%")
+        self.label_battery.setStyleSheet("color: gray; font-size: 12px;")
+        top_row.addWidget(self.label_datetime)
+        top_row.addSpacing(10)
+        top_row.addWidget(self.label_battery)
+        layout.addLayout(top_row)
+
+        separator = QFrame()
+        separator.setFixedHeight(1)
+        separator.setStyleSheet("background-color: gray;")
+        layout.addSpacing(10)
+        layout.addWidget(separator)
+
+        # Numeric labels
+        self.label_hr = self.create_data("HR", "--", "bpm", "lime", 80)
+        self.label_spo2 = self.create_data("SpO₂", "--%", "", "red", 50)
+        self.label_resp = self.create_data("RESP", "--", "rpm", "yellow", 70)
+        self.label_temp = self.create_data("TEMP", "--°C", "", "cyan", 50)
+        self.label_nibp = self.create_data("NIBP", "--", "mmHg", "orange", 50)
+
+        layout.addWidget(self.label_hr)
+        layout.addWidget(self.label_spo2)
+        layout.addWidget(self.label_resp)
+        layout.addWidget(self.label_temp)
+        layout.addWidget(self.label_nibp)
+        return layout
+
+    def create_data(self, title, value, unit, color, size):
+        container = QFrame()
+        layout = QVBoxLayout()
+        row = QHBoxLayout()
+        row.addWidget(QLabel(f"<span style='color:{color}; font-size:25px'>{title}</span>"))
+        row.addStretch()
+        row.addWidget(QLabel(f"<span style='color:{color}; font-size:19px'>{unit}</span>"))
+        layout.addLayout(row)
+
+        self.value_label = QLabel(value)
+        self.value_label.setStyleSheet(f"color: {color}; font-size: {size}px; font-weight: bold;")
+        self.value_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.value_label)
+
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background-color: gray;")
+        layout.addWidget(sep)
+
+        container.setLayout(layout)
+        container.value_label = self.value_label
+        return container
+    
+    # New method to handle key press events
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Q:
+            self.close()
+
+    def show_menu(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings Menu")
+        dialog.setStyleSheet("background-color: #222; color: white;")
+        layout = QVBoxLayout()
+        for item in [
+            "Patient Info", "Trend Menu", "Alarm Settings", "Monitor Setup",
+            "Parameter Setup", "Record / Screenshot", "Network / Connectivity", "System Settings"
+        ]:
+            btn = QPushButton(item)
+            btn.setStyleSheet("background-color: #444; color: white; padding: 8px; font-size: 14px;")
+            btn.clicked.connect(lambda _, name=item: self.show_submenu(name))
+            layout.addWidget(btn)
+
+        dialog.setLayout(layout)
+        dialog.resize(400, 400)
+        dialog.exec_()
+
+    def show_submenu(self, name):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(name)
+        dlg.setStyleSheet("background-color: #333; color: white;")
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel(f"{name} configuration goes here..."))
+        dlg.setLayout(layout)
+        dlg.exec_()
+
+    def update_datetime(self):
+        now = datetime.datetime.now()
+        self.label_datetime.setText(now.strftime("%Y-%m-%d %H:%M:%S"))
+
+    def update_waveform_display(self):
+        # Check if data has been received at all, or if data stream has stopped
+        if not self.data_received_once or (time.time() - self.last_data_timestamp) > 1.0:
+            # If no data, set numeric values to placeholder and waveforms to flat lines
+            self.label_hr.value_label.setText("--")
+            self.label_spo2.value_label.setText("--%")
+            self.label_resp.value_label.setText("--")
+            self.label_temp.value_label.setText("--°C")
+            self.label_nibp.value_label.setText("--\--")
+            
+            for key in self.signal_data:
+                self.signal_data[key].fill(0) # Make all waveform data a flat line at zero
+            
+            # Show "Lead off" text on all plots
+            self.ecg_I_text.show()
+            self.ecg_II_text.show()
+            self.ecg_V_text.show()
+            self.pleth_text.show()
+            self.resp_text.show()
+            
+        else:
+            # Update numeric values based on current data
+            self.label_hr.value_label.setText(str(self.numeric_values.get('HR', '--')))
+            self.label_spo2.value_label.setText(f"{self.numeric_values.get('SpO2', '--')}%")
+            self.label_resp.value_label.setText(str(self.numeric_values.get('RESP', '--')))
+            self.label_temp.value_label.setText(f"{self.numeric_values.get('TEMP', '--')}°C")
+
+            # Update NIBP label separately due to its specific format
+            nibp_values = self.numeric_values.get('NIBP', {'systolic': '--', 'diastolic': '--'})
+            sys_val = nibp_values['systolic'] if 'systolic' in nibp_values else '--'
+            dia_val = nibp_values['diastolic'] if 'diastolic' in nibp_values else '--'
+            self.label_nibp.value_label.setText(f"{sys_val}\{dia_val}")
+
+            # Hide "Lead off" text
+            self.ecg_I_text.hide()
+            self.ecg_II_text.hide()
+            self.ecg_V_text.hide()
+            self.pleth_text.hide()
+            self.resp_text.hide()
+
+        # Update the waveform curves with the (now potentially zeroed) data
+        self.ecg_I_curve.setData(self.x, self.signal_data[self.selected_leads['ecg_plot_1']])
+        self.ecg_II_curve.setData(self.x, self.signal_data[self.selected_leads['ecg_plot_2']])
+        self.ecg_V_curve.setData(self.x, self.signal_data[self.selected_leads['ecg_plot_3']])
+        self.pleth_curve.setData(self.x, self.signal_data['Pleth'])
+        self.resp_curve.setData(self.x, self.signal_data['RESP'])
+
+        vpos = self.x[self.index]
+        self.ecg_I_vline.setPos(vpos)
+        self.ecg_II_vline.setPos(vpos)
+        self.ecg_V_vline.setPos(vpos)
+        self.pleth_vline.setPos(vpos)
+        self.resp_vline.setPos(vpos)
+        self.index = (self.index + 1) % self.buffer_size
+
+    def receive_serial_data(self, data):
+        # Memisahkan data gelombang dari data numerik
+        waveform_data = {
+            'I': data.get('I_WAVEFORM'),
+            'II': data.get('II_WAVEFORM'),
+            'III': data.get('III_WAVEFORM'),
+            'V': data.get('V_WAVEFORM'),
+            'V1': data.get('V1_WAVEFORM'),
+            'V2': data.get('V2_WAVEFORM'),
+            'V3': data.get('V3_WAVEFORM'),
+            'V4': data.get('V4_WAVEFORM'),
+            'V5': data.get('V5_WAVEFORM'),
+            'Pleth': data.get('SpO2_WAVEFORM'), # Gunakan data SpO2 waveform untuk Pleth
+            'RESP': data.get('RESP_WAVEFORM')   # Gunakan data RESP waveform untuk RESP
+        }
+        
+        numeric_data = {
+            'HR': data.get('HR'),
+            'SpO2': data.get('SpO2'),
+            'RESP': data.get('RESP'),
+            'TEMP': data.get('TEMP'),
+            'NIBP': data.get('NIBP')
+        }
+
+        # Perbarui buffer gelombang
+        for key, value in waveform_data.items():
+            if value is not None and key in self.signal_data:
+                self.signal_data[key][self.index] = value
+        
+        # Perbarui nilai numerik
+        for key, value in numeric_data.items():
+            if key == 'NIBP' and isinstance(value, dict):
+                self.numeric_values['NIBP'] = value
+            elif value is not None and key in self.numeric_values:
+                self.numeric_values[key] = value
+
+        # Update the timestamp whenever data is received
+        self.last_data_timestamp = time.time()
+        # Set the flag to indicate data has been received at least once
+        self.data_received_once = True
+
+    def start_serial_thread(self):
+        def read_serial():
+            try:
+                # Ubah "COM3" atau "/dev/ttyACM0" ke port serial yang sesuai dengan Arduino Anda.
+                ser = serial.Serial("/dev/ttyACM1", 9600, timeout=1)
+                print("Terhubung ke port serial.")
+                while True:
+                    line = ser.readline().decode(errors="ignore").strip()
+                    if line:
+                        try:
+                            # Menguraikan data dari string serial. Format:
+                            # I,II,III,V,V1,V2,V3,V4,V5,PR,SpO2_N,SpO2_W,RESP_N,RESP_W,TEMP,NIBP(sistol\diastol)
+                            parts = line.split(',')
+                            if len(parts) == 16:
+                                nibp_parts = parts[15].split('\\')
+                                if len(nibp_parts) == 2:
+                                    data_dict = {
+                                        'I_WAVEFORM': float(parts[0]), 'II_WAVEFORM': float(parts[1]), 
+                                        'III_WAVEFORM': float(parts[2]), 'V_WAVEFORM': float(parts[3]),
+                                        'V1_WAVEFORM': float(parts[4]), 'V2_WAVEFORM': float(parts[5]), 
+                                        'V3_WAVEFORM': float(parts[6]), 'V4_WAVEFORM': float(parts[7]),
+                                        'V5_WAVEFORM': float(parts[8]), 
+                                        'HR': float(parts[9]), 'SpO2': float(parts[10]),
+                                        'SpO2_WAVEFORM': float(parts[11]),
+                                        'RESP': float(parts[12]), 'RESP_WAVEFORM': float(parts[13]),
+                                        'TEMP': float(parts[14]),
+                                        'NIBP': {'systolic': int(nibp_parts[0]), 'diastolic': int(nibp_parts[1])}
+                                    }
+                                    self.serial_data.data_received.emit(data_dict)
+                        except (ValueError, IndexError) as e:
+                            # Lewati baris yang tidak valid
+                            print(f"Error parsing data: {e}")
+                            continue
+            except serial.SerialException:
+                print("Gagal membuka port serial. Menunggu koneksi...")
+                return
+
+        thread = threading.Thread(target=read_serial, daemon=True)
+        thread.start()
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = PatientMonitor()
+    window.show()
+    sys.exit(app.exec_())
